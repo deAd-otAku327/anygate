@@ -20,22 +20,40 @@ func NewProxy(from, to string, cfg config.Proxy) fasthttp.RequestHandler {
 	}
 	pathBuilder := utils.NewPathBuilder(to, len(from), cfg.RouteLenHint)
 	client := NewClient(cfg)
-	// closure workload - caution, hot path!
 	return func(ctx *fasthttp.RequestCtx) {
-		ctx.Request.SetRequestURI(pathBuilder.Build(ctx.Path()))
+		uri := pathBuilder.Build(ctx.Path())
+		ctx.Request.SetRequestURI(uri)
 		ctx.Request.SetTimeout(cfg.Timeout)
+		log.Info().
+			Str("from", from).
+			Str("to", to).
+			Str("uri", uri).
+			Str("method", string(ctx.Method())).
+			Str("path", string(ctx.Path())).
+			Msg("Proxying request")
 		err := client.Do(&ctx.Request, &ctx.Response)
 		switch err {
 		case nil:
-			// NO ERROR -> DO NOTHING
+			log.Info().
+				Str("to", to).
+				Int("status", ctx.Response.StatusCode()).
+				Msg("Proxy success")
 		case fasthttp.ErrTimeout:
 			ctx.SetStatusCode(cfg.StatusGatewayTimeout)
 			ctx.SetBodyString(`{"error":"timeout"}`)
-			log.Error().Err(err).Str("to", to).Str("from", from).Msg("timeout")
+			log.Error().
+				Err(err).
+				Str("to", to).
+				Str("from", from).
+				Msg("timeout")
 		default:
 			ctx.SetStatusCode(cfg.StatusBadGateway)
 			ctx.SetBodyString(`{"error":"` + err.Error() + `"}`)
-			log.Error().Err(err).Str("to", to).Str("from", from).Msg("gateway")
+			log.Error().
+				Err(err).
+				Str("to", to).
+				Str("from", from).
+				Msg("gateway")
 		}
 	}
 }

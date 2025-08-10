@@ -13,11 +13,10 @@ import (
 
 // 🏗️ Register — чертёж памяти, где каждый путь знает свою судьбу.
 func Register(r *router.Router, cfg config.Root, inheritedPlugins ...plugin.Spec) {
-	// Склеиваем middleware цепочку текущий группы
+	log.Info().Int("routes", len(cfg.Routes)).Int("swagger", len(cfg.Swagger)).Msg("Registering handlers")
 	fullChain := make([]plugin.Spec, 0, len(inheritedPlugins)+len(cfg.Plugins))
 	fullChain = append(fullChain, inheritedPlugins...)
 	fullChain = append(fullChain, cfg.Plugins...)
-	// Регистрируем маршруты текущей группы
 	for fromSpec, to := range cfg.Routes {
 		methods, from := parseFromSpec(fromSpec)
 		base, mode := New(from, to, cfg)
@@ -27,13 +26,15 @@ func Register(r *router.Router, cfg config.Root, inheritedPlugins ...plugin.Spec
 			log.Info().Str("from", from).Str("method", method).Str("to", to).Str("mode", mode).Msg("route")
 		}
 	}
-	// Рекурсивно обрабатываем подгруппы
 	for _, child := range cfg.Groups {
 		Register(r, child, fullChain...)
 	}
 
 	if len(cfg.Swagger) > 0 {
+		log.Info().Any("swagger", cfg.Swagger).Msg("Calling registerSwaggerMultiUI")
 		registerSwaggerMultiUI(r, cfg)
+	} else {
+		log.Warn().Msg("No Swagger configurations found")
 	}
 }
 
