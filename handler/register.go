@@ -70,6 +70,7 @@ func parseFromSpec(spec string) ([]string, string) {
 }
 
 func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
+	log.Info().Msg("Registering Swagger UI handlers")
 	urlsList := make([]string, 0, len(cfg.Swagger))
 
 	for name, remote := range cfg.Swagger {
@@ -79,14 +80,13 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 			ext = ".json"
 		}
 
-		// Локальный путь, под которым будем проксировать
 		specPath := "/swagger/specs/" + slug + ext
-
-		// Проксируем как есть
-		proxyH, _ := New(specPath, remote, cfg)
+		log.Info().Str("name", name).Str("remote", remote).Str("specPath", specPath).Msg("Registering proxy handler")
+		proxyH, proxyType := New(specPath, remote, cfg)
+		if proxyType != "proxy" {
+			log.Fatal().Str("remote", remote).Str("type", proxyType).Msg("Expected proxy handler")
+		}
 		r.Register("GET", specPath, proxyH)
-
-		// Добавляем в список для UI
 		urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, name, specPath))
 	}
 
@@ -110,14 +110,15 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
   </body>
 </html>`, strings.Join(urlsList, ",\n        "))
 
-	// /swagger и /swagger/index.html
 	handler := func(ctx *fasthttp.RequestCtx) {
+		log.Info().Str("path", string(ctx.Path())).Msg("Serving Swagger UI")
 		ctx.SetContentType("text/html; charset=utf-8")
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		_, _ = ctx.WriteString(html)
 	}
 	r.Register("GET", "/swagger", handler)
 	r.Register("GET", "/swagger/index.html", handler)
+	log.Info().Msg("Swagger UI handlers registered")
 }
 
 // func parseFromSpec(to string) (method, path string) {
