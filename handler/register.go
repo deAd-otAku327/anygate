@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/rs/zerolog/log"
@@ -29,6 +30,10 @@ func Register(r *router.Router, cfg config.Root, inheritedPlugins ...plugin.Spec
 	// Рекурсивно обрабатываем подгруппы
 	for _, child := range cfg.Groups {
 		Register(r, child, fullChain...)
+	}
+
+	if len(cfg.Swagger) > 0 {
+		registerSwaggerMultiUI(r, cfg)
 	}
 }
 
@@ -62,6 +67,57 @@ func parseFromSpec(spec string) ([]string, string) {
 		methods = append(methods, strings.ToUpper(m))
 	}
 	return methods, parts[len(parts)-1]
+}
+
+func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
+	urlsList := make([]string, 0, len(cfg.Swagger))
+
+	for name, remote := range cfg.Swagger {
+		slug := strings.ToLower(name)
+		ext := ".yaml"
+		if strings.HasSuffix(remote, ".json") {
+			ext = ".json"
+		}
+
+		// Локальный путь, под которым будем проксировать
+		specPath := "/swagger/specs/" + slug + ext
+
+		// Проксируем как есть
+		proxyH, _ := New(specPath, remote, cfg)
+		r.Register("GET", specPath, proxyH)
+
+		// Добавляем в список для UI
+		urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, name, specPath))
+	}
+
+	html := fmt.Sprintf(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Swagger UI</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+      window.ui = SwaggerUIBundle({
+        urls: [%s],
+        dom_id: '#swagger-ui',
+        deepLinking: true
+      });
+    </script>
+  </body>
+</html>`, strings.Join(urlsList, ",\n        "))
+
+	// /swagger и /swagger/index.html
+	handler := func(ctx *fasthttp.RequestCtx) {
+		ctx.SetContentType("text/html; charset=utf-8")
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		_, _ = ctx.WriteString(html)
+	}
+	r.Register("GET", "/swagger", handler)
+	r.Register("GET", "/swagger/index.html", handler)
 }
 
 // func parseFromSpec(to string) (method, path string) {

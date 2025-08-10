@@ -13,6 +13,7 @@ type Root struct {
 	Static  Static            `yaml:"static"`
 	Plugins []plugin.Spec     `yaml:"plugins"`
 	Groups  []Root            `yaml:"groups"`
+	Swagger map[string]string `yaml:"swagger"`
 }
 
 // 📦 Static — контракт между диском и путём.
