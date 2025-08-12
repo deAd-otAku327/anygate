@@ -190,7 +190,7 @@ func pickExt(u string) string {
 	return ".json"
 }
 
-// нормализуем «базу» (если передали /swagger/index.html, /swagger/doc.json и т.п.)
+// нормализуем «базу» (если передали /swagger/index.html, /swagger, /swagger/doc.json и т.п.)
 func normalizeBaseURL(u string) (base string) {
 	l := strings.ToLower(strings.TrimSpace(u))
 	switch {
@@ -230,7 +230,7 @@ func httpGet(client *fasthttp.Client, u string) (int, []byte, error) {
 	return resp.StatusCode(), append([]byte(nil), resp.Body()...), nil
 }
 
-// Поддержка Accept для стабильной отдачи спеки
+// форсим Accept, чтобы апстрим не отдал HTML вместо JSON/YAML
 func withAcceptForSpecs(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		ctx.Request.Header.Set("Accept", "application/json, application/yaml, application/x-yaml, text/yaml, */*;q=0.1")
@@ -240,7 +240,7 @@ func withAcceptForSpecs(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 
 /* =========== Парсинг index.html =========== */
 
-// 1) Пытаемся вытащить urls: [ {name,url}, ... ] из JS-конфига SwaggerUIBundle({...})
+// A) urls: [ {name,url}, ... ] внутри SwaggerUIBundle({...})
 func extractURLsBlockFromIndexHTML(html []byte) []byte {
 	re := regexp.MustCompile(`urls\s*:\s*(\[[\s\S]*?\])`)
 	m := re.FindSubmatch(html)
@@ -268,8 +268,9 @@ func normalizeJSArrayToJSON(b []byte) []byte {
 	return []byte(s)
 }
 
-// 2) Пытаемся вытащить одиночный url: "..."
+// B) одиночный url: "..."
 func extractSingleURLFromIndexHTML(html []byte) string {
+	// поддержим и двойные, и одинарные кавычки
 	re := regexp.MustCompile(`url\s*:\s*["']([^"']+)["']`)
 	m := re.FindSubmatch(html)
 	if len(m) >= 2 {
@@ -278,7 +279,7 @@ func extractSingleURLFromIndexHTML(html []byte) string {
 	return ""
 }
 
-// 3) На всякий случай, соберём любые .json/.yaml/.yml из href/src
+// C) любые *.json|*.yaml|*.yml в href/src
 func extractSpecLikeLinks(html []byte) []string {
 	re := regexp.MustCompile(`(?:href|src)\s*=\s*["']([^"']+\.(?:json|ya?ml))["']`)
 	out := []string{}
@@ -308,7 +309,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 
 	for name, remote := range cfg.Swagger {
 		baseName := name
-		base := normalizeBaseURL(remote) // позволяем кидать и /swagger/index.html
+		base := normalizeBaseURL(remote) // можно давать /swagger/index.html, /swagger, /swagger/doc.json, просто /host:port
 		base = strings.TrimRight(base, "/")
 		slug := slugify(baseName)
 
@@ -319,7 +320,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		if err != nil || status >= 300 {
 			log.Error().Err(err).Int("status", status).Str("indexURL", indexURL).Msg("Failed to fetch index.html; falling back to common paths")
 
-			// Фолбэки: попробуем популярные пути напрямую
+			// Фолбэки (включая YAML)
 			candidates := []string{
 				base + "/swagger/doc.json",
 				base + "/swagger.json",
@@ -344,15 +345,17 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		}
 
 		found := 0
+		// Для index.html swagger’а все относительные пути считаем относительно /swagger/
+		relBase := base + "/swagger/"
 
-		// A) urls: [ {name,url}, ... ]
+		// A) urls: [...]
 		if blk := extractURLsBlockFromIndexHTML(body); blk != nil {
 			norm := normalizeJSArrayToJSON(blk)
 			var entries []swaggerEntry
 			if err := json.Unmarshal(norm, &entries); err == nil && len(entries) > 0 {
 				log.Info().Int("count", len(entries)).Str("base", base).Msg("Found urls[] in index.html")
 				for i, it := range entries {
-					abs, err := resolveURL(base+"/swagger/", it.URL) // часто url относительный от /swagger/
+					abs, err := resolveURL(relBase, it.URL)
 					if err != nil {
 						log.Error().Err(err).Str("rel", it.URL).Msg("resolve url failed")
 						continue
@@ -382,10 +385,10 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 			}
 		}
 
-		// B) url: "..."
+		// B) url: "doc.json" (твой случай)
 		if found == 0 {
 			if single := extractSingleURLFromIndexHTML(body); single != "" {
-				if abs, err := resolveURL(base+"/swagger/", single); err == nil {
+				if abs, err := resolveURL(relBase, single); err == nil {
 					specPath := "/swagger/specs/" + slug + pickExt(abs)
 					proxyH, proxyType := New(specPath, abs, cfg)
 					if proxyType == "proxy" {
@@ -398,13 +401,13 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 			}
 		}
 
-		// C) любые .json/.yaml/.yml ссылки в HTML
+		// C) ссылочные *.json/*.yaml/*.yml
 		if found == 0 {
 			links := extractSpecLikeLinks(body)
 			if len(links) > 0 {
 				log.Info().Int("count", len(links)).Msg("Found spec-like links in index.html")
 				for i, rel := range links {
-					abs, err := resolveURL(base+"/swagger/", rel)
+					abs, err := resolveURL(relBase, rel)
 					if err != nil {
 						continue
 					}
@@ -420,7 +423,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 			}
 		}
 
-		// D) если вообще ничего, то фолбэки
+		// D) если вообще ничего — фолбэки
 		if found == 0 {
 			log.Warn().Str("base", base).Msg("No specs found in index.html; applying fallbacks")
 			candidates := []string{
@@ -445,7 +448,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		}
 	}
 
-	// Строим наш UI
+	// UI
 	html := fmt.Sprintf(`<!doctype html>
 <html>
   <head>
