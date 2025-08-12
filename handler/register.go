@@ -164,7 +164,7 @@ func parseFromSpec(spec string) ([]string, string) {
 	return methods, parts[len(parts)-1]
 }
 
-/* ================= Helpers ================= */
+/* ============ helpers ============ */
 
 type swaggerEntry struct {
 	Name string `json:"name"`
@@ -190,7 +190,7 @@ func pickExt(u string) string {
 	return ".json"
 }
 
-// нормализуем «базу» (если передали /swagger/index.html, /swagger, /swagger/doc.json и т.п.)
+// нормализуем «базу» (/swagger/index.html, /swagger, /swagger/doc.json, просто хост)
 func normalizeBaseURL(u string) (base string) {
 	l := strings.ToLower(strings.TrimSpace(u))
 	switch {
@@ -230,7 +230,7 @@ func httpGet(client *fasthttp.Client, u string) (int, []byte, error) {
 	return resp.StatusCode(), append([]byte(nil), resp.Body()...), nil
 }
 
-// форсим Accept, чтобы апстрим не отдал HTML вместо JSON/YAML
+// форсим Accept (некоторые сервисты иначе отдают text/html)
 func withAcceptForSpecs(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		ctx.Request.Header.Set("Accept", "application/json, application/yaml, application/x-yaml, text/yaml, */*;q=0.1")
@@ -238,9 +238,38 @@ func withAcceptForSpecs(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	}
 }
 
-/* =========== Парсинг index.html =========== */
+// после проксирования чиним Content-Type, если апстрим отдал HTML/пусто
+func wrapSpecProxy(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+	return func(ctx *fasthttp.RequestCtx) {
+		next(ctx) // ответ уже в ctx.Response
 
-// A) urls: [ {name,url}, ... ] внутри SwaggerUIBundle({...})
+		ct := string(ctx.Response.Header.ContentType())
+		body := ctx.Response.Body()
+
+		needsFix := ct == "" || strings.Contains(ct, "text/html")
+		if needsFix && len(body) > 0 {
+			switch body[0] {
+			case '{', '[':
+				ctx.Response.Header.SetContentType("application/json")
+			default:
+				trim := bytes.TrimSpace(body)
+				if bytes.HasPrefix(trim, []byte("---")) || bytes.HasPrefix(trim, []byte("openapi:")) || bytes.HasPrefix(trim, []byte("swagger:")) {
+					ctx.Response.Header.SetContentType("application/yaml")
+				}
+			}
+		}
+
+		log.Info().
+			Int("status", ctx.Response.StatusCode()).
+			Str("content_type", string(ctx.Response.Header.ContentType())).
+			Str("path", string(ctx.Path())).
+			Msg("spec proxy response")
+	}
+}
+
+/* ======== парсинг index.html ======== */
+
+// urls: [ {name: "...", url: "..."}, ... ]
 func extractURLsBlockFromIndexHTML(html []byte) []byte {
 	re := regexp.MustCompile(`urls\s*:\s*(\[[\s\S]*?\])`)
 	m := re.FindSubmatch(html)
@@ -252,25 +281,20 @@ func extractURLsBlockFromIndexHTML(html []byte) []byte {
 
 func normalizeJSArrayToJSON(b []byte) []byte {
 	s := string(b)
-	// убрать комментарии
 	reLine := regexp.MustCompile(`(?m)//.*$`)
 	reBlock := regexp.MustCompile(`(?s)/\*.*?\*/`)
 	s = reLine.ReplaceAllString(s, "")
 	s = reBlock.ReplaceAllString(s, "")
-	// ' -> "
 	s = strings.ReplaceAll(s, `'`, `"`)
-	// ключи без кавычек -> в кавычки
 	reKey := regexp.MustCompile(`(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:`)
 	s = reKey.ReplaceAllString(s, `${1}"${2}":`)
-	// висячие запятые
 	reTrailing := regexp.MustCompile(`,(\s*[\]\}])`)
 	s = reTrailing.ReplaceAllString(s, `$1`)
 	return []byte(s)
 }
 
-// B) одиночный url: "..."
+// одиночный url: "doc.json"
 func extractSingleURLFromIndexHTML(html []byte) string {
-	// поддержим и двойные, и одинарные кавычки
 	re := regexp.MustCompile(`url\s*:\s*["']([^"']+)["']`)
 	m := re.FindSubmatch(html)
 	if len(m) >= 2 {
@@ -279,7 +303,7 @@ func extractSingleURLFromIndexHTML(html []byte) string {
 	return ""
 }
 
-// C) любые *.json|*.yaml|*.yml в href/src
+// любые *.json|*.yaml|*.yml в href/src
 func extractSpecLikeLinks(html []byte) []string {
 	re := regexp.MustCompile(`(?:href|src)\s*=\s*["']([^"']+\.(?:json|ya?ml))["']`)
 	out := []string{}
@@ -295,7 +319,7 @@ func extractSpecLikeLinks(html []byte) []string {
 	return out
 }
 
-/* ============== Main ============== */
+/* ============== main ============== */
 
 func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 	log.Info().Msg("Registering Swagger UI handlers (index.html autodiscovery)")
@@ -309,7 +333,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 
 	for name, remote := range cfg.Swagger {
 		baseName := name
-		base := normalizeBaseURL(remote) // можно давать /swagger/index.html, /swagger, /swagger/doc.json, просто /host:port
+		base := normalizeBaseURL(remote) // можно давать /swagger/index.html, /swagger, /swagger/doc.json, просто хост
 		base = strings.TrimRight(base, "/")
 		slug := slugify(baseName)
 
@@ -320,7 +344,6 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		if err != nil || status >= 300 {
 			log.Error().Err(err).Int("status", status).Str("indexURL", indexURL).Msg("Failed to fetch index.html; falling back to common paths")
 
-			// Фолбэки (включая YAML)
 			candidates := []string{
 				base + "/swagger/doc.json",
 				base + "/swagger.json",
@@ -337,7 +360,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 				if proxyType != "proxy" {
 					continue
 				}
-				r.Register("GET", specPath, withAcceptForSpecs(proxyH))
+				r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
 				urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, baseName+" • fallback", specPath))
 				log.Info().Str("remote", c).Str("specPath", specPath).Msg("Registered fallback spec")
 			}
@@ -345,8 +368,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		}
 
 		found := 0
-		// Для index.html swagger’а все относительные пути считаем относительно /swagger/
-		relBase := base + "/swagger/"
+		relBase := base + "/swagger/" // index.html обычно резолвит относительные от /swagger/
 
 		// A) urls: [...]
 		if blk := extractURLsBlockFromIndexHTML(body); blk != nil {
@@ -372,7 +394,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 					if proxyType != "proxy" {
 						continue
 					}
-					r.Register("GET", specPath, withAcceptForSpecs(proxyH))
+					r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
 					uiName := baseName
 					if it.Name != "" {
 						uiName += " • " + it.Name
@@ -385,14 +407,14 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 			}
 		}
 
-		// B) url: "doc.json" (твой случай)
+		// B) url: "doc.json" (твой кейс)
 		if found == 0 {
 			if single := extractSingleURLFromIndexHTML(body); single != "" {
 				if abs, err := resolveURL(relBase, single); err == nil {
 					specPath := "/swagger/specs/" + slug + pickExt(abs)
 					proxyH, proxyType := New(specPath, abs, cfg)
 					if proxyType == "proxy" {
-						r.Register("GET", specPath, withAcceptForSpecs(proxyH))
+						r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
 						urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, baseName, specPath))
 						log.Info().Str("remote", abs).Str("specPath", specPath).Msg("Registered single spec from index.html")
 						found++
@@ -401,7 +423,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 			}
 		}
 
-		// C) ссылочные *.json/*.yaml/*.yml
+		// C) *.json|*.yaml|*.yml в HTML
 		if found == 0 {
 			links := extractSpecLikeLinks(body)
 			if len(links) > 0 {
@@ -416,14 +438,14 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 					if proxyType != "proxy" {
 						continue
 					}
-					r.Register("GET", specPath, withAcceptForSpecs(proxyH))
+					r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
 					urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, baseName+" • link", specPath))
 					found++
 				}
 			}
 		}
 
-		// D) если вообще ничего — фолбэки
+		// D) если ничего не нашли — фолбэки
 		if found == 0 {
 			log.Warn().Str("base", base).Msg("No specs found in index.html; applying fallbacks")
 			candidates := []string{
@@ -442,13 +464,27 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 				if proxyType != "proxy" {
 					continue
 				}
-				r.Register("GET", specPath, withAcceptForSpecs(proxyH))
+				r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
 				urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, baseName+" • fallback", specPath))
 			}
 		}
 	}
 
-	// UI
+	// Генерим UI (validatorUrl: null, auto-select первого)
+	primaryName := ""
+	if len(urlsList) > 0 {
+		// urlsList элементы вида {name: "...", url: "..."}
+		// вытащим имя простым поиском
+		s := urlsList[0]
+		i := strings.Index(s, `name: "`)
+		if i >= 0 {
+			i += len(`name: "`)
+			if j := strings.Index(s[i:], `"`); j >= 0 {
+				primaryName = s[i : i+j]
+			}
+		}
+	}
+
 	html := fmt.Sprintf(`<!doctype html>
 <html>
   <head>
@@ -462,12 +498,15 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
     <script>
       window.ui = SwaggerUIBundle({
         urls: [%s],
+        urlsPrimaryName: %q,
         dom_id: '#swagger-ui',
-        deepLinking: true
+        deepLinking: true,
+        validatorUrl: null,
+        layout: "BaseLayout"
       });
     </script>
   </body>
-</html>`, strings.Join(urlsList, ",\n        "))
+</html>`, strings.Join(urlsList, ",\n        "), primaryName)
 
 	handler := func(ctx *fasthttp.RequestCtx) {
 		log.Info().Str("path", string(ctx.Path())).Int("specs", len(urlsList)).Msg("Serving Swagger UI")
