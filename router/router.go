@@ -51,10 +51,12 @@ func insert(n *node, path string, method string, handler fasthttp.RequestHandler
 			child := &node{
 				prefix:   n.prefix[common:],
 				handlers: n.handlers,
+				wild:     n.wild, // ← переносим wild
 				children: n.children,
 			}
 			n.prefix = path[:common]
 			n.handlers = nil
+			n.wild = nil
 			n.children = []*node{child}
 		}
 		path = path[common:]
@@ -70,12 +72,19 @@ func insert(n *node, path string, method string, handler fasthttp.RequestHandler
 			return
 		}
 
+		// ↓ корректный спуск к ребёнку
+		found := false
 		for _, child := range n.children {
 			if strings.HasPrefix(path, child.prefix) {
 				n = child
-				continue
+				found = true
+				break
 			}
 		}
+		if found {
+			continue
+		}
+
 		newChild := &node{
 			prefix:   path,
 			handlers: map[string]fasthttp.RequestHandler{},
@@ -83,39 +92,45 @@ func insert(n *node, path string, method string, handler fasthttp.RequestHandler
 		n.children = append(n.children, newChild)
 		if method != "" {
 			newChild.handlers[method] = handler
-			return
+		} else {
+			newChild.wild = handler
 		}
-		newChild.wild = handler
-
 		return
 	}
 }
 
 func lookup(n *node, path string, method string) fasthttp.RequestHandler {
 	for {
-		if strings.HasPrefix(path, n.prefix) {
-			path = path[len(n.prefix):]
-			if len(path) == 0 && n.handlers != nil {
-				h := n.handlers[method]
-				if h != nil {
-					return h
-				}
-				return n.wild
-			}
-			for _, child := range n.children {
-				if strings.HasPrefix(path, child.prefix) {
-					n = child
-					continue
-				}
-			}
-			if n.handlers != nil {
-				h := n.handlers[method]
-				if h != nil {
-					return h
-				}
-				return n.wild
-			}
+		if !strings.HasPrefix(path, n.prefix) {
 			return nil
+		}
+		path = path[len(n.prefix):]
+
+		if len(path) == 0 && n.handlers != nil {
+			if h := n.handlers[method]; h != nil {
+				return h
+			}
+			return n.wild
+		}
+
+		// ↓ корректный спуск к ребёнку
+		found := false
+		for _, child := range n.children {
+			if strings.HasPrefix(path, child.prefix) {
+				n = child
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+
+		if n.handlers != nil {
+			if h := n.handlers[method]; h != nil {
+				return h
+			}
+			return n.wild
 		}
 		return nil
 	}
