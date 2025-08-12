@@ -16,6 +16,7 @@ func init() {
 }
 
 func main() {
+	log.Info().Msg("hello world!!!!")
 	// init
 	rootConfig := config.NewRoot()
 	log.Debug().Any("root", rootConfig).Msg("config.NewRoot")
