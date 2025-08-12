@@ -190,7 +190,7 @@ func pickExt(u string) string {
 	return ".json"
 }
 
-// нормализуем «базу» (/swagger/index.html, /swagger, /swagger/doc.json, просто хост)
+// нормализуем «базу» (/swagger/index.html, /swagger, /swagger/doc.json, либо просто хост)
 func normalizeBaseURL(u string) (base string) {
 	l := strings.ToLower(strings.TrimSpace(u))
 	switch {
@@ -230,7 +230,7 @@ func httpGet(client *fasthttp.Client, u string) (int, []byte, error) {
 	return resp.StatusCode(), append([]byte(nil), resp.Body()...), nil
 }
 
-// форсим Accept (некоторые сервисты иначе отдают text/html)
+// форсим Accept (иначе некоторые сервисы отдают text/html)
 func withAcceptForSpecs(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		ctx.Request.Header.Set("Accept", "application/json, application/yaml, application/x-yaml, text/yaml, */*;q=0.1")
@@ -253,7 +253,9 @@ func wrapSpecProxy(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 				ctx.Response.Header.SetContentType("application/json")
 			default:
 				trim := bytes.TrimSpace(body)
-				if bytes.HasPrefix(trim, []byte("---")) || bytes.HasPrefix(trim, []byte("openapi:")) || bytes.HasPrefix(trim, []byte("swagger:")) {
+				if bytes.HasPrefix(trim, []byte("---")) ||
+					bytes.HasPrefix(trim, []byte("openapi:")) ||
+					bytes.HasPrefix(trim, []byte("swagger:")) {
 					ctx.Response.Header.SetContentType("application/yaml")
 				}
 			}
@@ -269,7 +271,7 @@ func wrapSpecProxy(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 
 /* ======== парсинг index.html ======== */
 
-// urls: [ {name: "...", url: "..."}, ... ]
+// urls: [ {name: "...", url: "..."}, ... ] внутри SwaggerUIBundle({...})
 func extractURLsBlockFromIndexHTML(html []byte) []byte {
 	re := regexp.MustCompile(`urls\s*:\s*(\[[\s\S]*?\])`)
 	m := re.FindSubmatch(html)
@@ -281,19 +283,23 @@ func extractURLsBlockFromIndexHTML(html []byte) []byte {
 
 func normalizeJSArrayToJSON(b []byte) []byte {
 	s := string(b)
+	// убрать комментарии
 	reLine := regexp.MustCompile(`(?m)//.*$`)
 	reBlock := regexp.MustCompile(`(?s)/\*.*?\*/`)
 	s = reLine.ReplaceAllString(s, "")
 	s = reBlock.ReplaceAllString(s, "")
+	// ' -> "
 	s = strings.ReplaceAll(s, `'`, `"`)
+	// ключи без кавычек -> в кавычки
 	reKey := regexp.MustCompile(`(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:`)
 	s = reKey.ReplaceAllString(s, `${1}"${2}":`)
+	// висячие запятые
 	reTrailing := regexp.MustCompile(`,(\s*[\]\}])`)
 	s = reTrailing.ReplaceAllString(s, `$1`)
 	return []byte(s)
 }
 
-// одиночный url: "doc.json"
+// одиночный url: "doc.json" / "openapi.json"
 func extractSingleURLFromIndexHTML(html []byte) string {
 	re := regexp.MustCompile(`url\s*:\s*["']([^"']+)["']`)
 	m := re.FindSubmatch(html)
@@ -407,7 +413,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 			}
 		}
 
-		// B) url: "doc.json" (твой кейс)
+		// B) url: "doc.json" (и т.п.)
 		if found == 0 {
 			if single := extractSingleURLFromIndexHTML(body); single != "" {
 				if abs, err := resolveURL(relBase, single); err == nil {
@@ -470,19 +476,39 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		}
 	}
 
-	// Генерим UI (validatorUrl: null, auto-select первого)
-	primaryName := ""
-	if len(urlsList) > 0 {
-		// urlsList элементы вида {name: "...", url: "..."}
-		// вытащим имя простым поиском
+	/* ---------- HTML с правильной конфигурацией UI ---------- */
+
+	// если одна спека — отдадим через `url:` (UI сразу поднимет её)
+	var singleURL, primaryName string
+	if len(urlsList) == 1 {
+		s := urlsList[0] // {name: "...", url: "..."}
+		if i := strings.Index(s, `url: "`); i >= 0 {
+			i += len(`url: "`)
+			if j := strings.Index(s[i:], `"`); j >= 0 {
+				singleURL = s[i : i+j]
+			}
+		}
+	} else if len(urlsList) > 1 {
+		// возьмём имя первой спеки для "urls.primaryName"
 		s := urlsList[0]
-		i := strings.Index(s, `name: "`)
-		if i >= 0 {
+		if i := strings.Index(s, `name: "`); i >= 0 {
 			i += len(`name: "`)
 			if j := strings.Index(s[i:], `"`); j >= 0 {
 				primaryName = s[i : i+j]
 			}
 		}
+	}
+
+	uiConfig := ""
+	if singleURL != "" {
+		uiConfig = fmt.Sprintf(`url: %q,`, singleURL)
+	} else {
+		// Важно: правильный ключ с точкой — "urls.primaryName"
+		uiConfig = fmt.Sprintf(`urls: [%s],
+        "urls.primaryName": %q,`,
+			strings.Join(urlsList, ",\n        "),
+			primaryName,
+		)
 	}
 
 	html := fmt.Sprintf(`<!doctype html>
@@ -497,8 +523,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
     <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
     <script>
       window.ui = SwaggerUIBundle({
-        urls: [%s],
-        urlsPrimaryName: %q,
+        %s
         dom_id: '#swagger-ui',
         deepLinking: true,
         validatorUrl: null,
@@ -506,7 +531,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
       });
     </script>
   </body>
-</html>`, strings.Join(urlsList, ",\n        "), primaryName)
+</html>`, uiConfig)
 
 	handler := func(ctx *fasthttp.RequestCtx) {
 		log.Info().Str("path", string(ctx.Path())).Int("specs", len(urlsList)).Msg("Serving Swagger UI")
