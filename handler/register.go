@@ -1,8 +1,13 @@
 package handler
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/valyala/fasthttp"
@@ -159,27 +164,191 @@ func parseFromSpec(spec string) ([]string, string) {
 	return methods, parts[len(parts)-1]
 }
 
+// --- ХЕЛПЕРЫ ---
+
+// распознать базовый адрес сервиса vs прямая ссылка на спецификацию
+func isBaseSwaggerURL(u string) bool {
+	l := strings.ToLower(u)
+	return !(strings.HasSuffix(l, ".json") || strings.HasSuffix(l, ".yaml") || strings.HasSuffix(l, ".yml"))
+}
+
+// получить swagger-initializer.js и вытащить из него массив urls
+func discoverSwaggerURLs(base string) ([]swaggerEntry, error) {
+	initializerURL := strings.TrimRight(base, "/") + "/swagger-initializer.js"
+
+	cli := &fasthttp.Client{
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+	}
+	var req fasthttp.Request
+	var resp fasthttp.Response
+	req.SetRequestURI(initializerURL)
+	req.Header.SetMethod(fasthttp.MethodGet)
+
+	if err := cli.Do(&req, &resp); err != nil {
+		return nil, fmt.Errorf("fetch initializer: %w", err)
+	}
+	if resp.StatusCode() >= 300 {
+		return nil, fmt.Errorf("initializer status %d", resp.StatusCode())
+	}
+
+	body := resp.Body()
+
+	// Находим кусок `urls: [ ... ]` (допускаем пробелы/переносы)
+	re := regexp.MustCompile(`urls\s*:\s*(\[[\s\S]*?\])`)
+	m := re.FindSubmatch(body)
+	if len(m) < 2 {
+		return nil, fmt.Errorf("urls array not found in initializer")
+	}
+
+	raw := bytes.TrimSpace(m[1])
+
+	// В swagger-initializer.js обычно JS-объекты, а не строгое JSON.
+	// Попробуем быстрый «почин»: заменим одинарные кавычки и безкавычный name/url на JSON-валидный формат.
+	norm := normalizeJSArrayToJSON(raw)
+
+	var out []swaggerEntry
+	if err := json.Unmarshal(norm, &out); err != nil {
+		// на всякий случай логируем, чтобы было видно на что упали
+		log.Error().Err(err).RawJSON("raw_urls_block", norm).Msg("parse initializer urls failed")
+		return nil, fmt.Errorf("parse urls json: %w", err)
+	}
+	return out, nil
+}
+
+type swaggerEntry struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+// Пытаемся привести JS-массив объектов к JSON
+func normalizeJSArrayToJSON(b []byte) []byte {
+	s := string(b)
+	// 1) кавычки одинарные -> двойные
+	s = strings.ReplaceAll(s, `'`, `"`)
+
+	// 2) ключи без кавычек -> в кавычки (только name и url нам важны)
+	//   {name: "X", url: "/a"} -> {"name":"X","url":"/a"}
+	reKey := regexp.MustCompile(`(\{|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:`)
+	s = reKey.ReplaceAllString(s, `${1}"${2}":`)
+
+	return []byte(s)
+}
+
+// правильная склейка base и относительного пути (./, ../, /)
+func resolveURL(baseStr, relStr string) (string, error) {
+	bu, err := url.Parse(baseStr)
+	if err != nil {
+		return "", err
+	}
+	ru, err := url.Parse(relStr)
+	if err != nil {
+		return "", err
+	}
+	if ru.IsAbs() {
+		return ru.String(), nil
+	}
+	// относительный — резолвим относительно base
+	return bu.ResolveReference(ru).String(), nil
+}
+
+// подобрать расширение по URL
+func pickExt(u string) string {
+	l := strings.ToLower(u)
+	switch {
+	case strings.HasSuffix(l, ".yaml"), strings.HasSuffix(l, ".yml"):
+		return ".yaml"
+	default:
+		return ".json"
+	}
+}
+
+// «слаг» из имени (в нижнем регистре, только a-z0-9-_)
+func slugify(s string) string {
+	s = strings.ToLower(s)
+	s = strings.TrimSpace(s)
+	re := regexp.MustCompile(`[^a-z0-9]+`)
+	s = re.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		s = "spec"
+	}
+	return s
+}
+
+// --- ОСНОВНАЯ ФУНКЦИЯ ---
+
 func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
-	log.Info().Msg("Registering Swagger UI handlers")
-	urlsList := make([]string, 0, len(cfg.Swagger))
+	log.Info().Msg("Registering Swagger UI handlers (auto-discovery enabled)")
+	urlsList := make([]string, 0, 16)
 
 	for name, remote := range cfg.Swagger {
-		slug := strings.ToLower(name)
-		ext := ".yaml"
-		if strings.HasSuffix(remote, ".json") {
-			ext = ".json"
+		slug := slugify(name)
+
+		if isBaseSwaggerURL(remote) {
+			// 1) autodiscover из swagger-initializer.js
+			discovered, err := discoverSwaggerURLs(remote)
+			if err != nil {
+				log.Error().Err(err).Str("base", remote).Str("name", name).Msg("Swagger autodiscover failed")
+				continue
+			}
+			if len(discovered) == 0 {
+				log.Warn().Str("base", remote).Str("name", name).Msg("Swagger autodiscover: no urls found")
+				continue
+			}
+
+			for i, it := range discovered {
+				// резолвим относительные пути в абсолютные
+				absURL, err := resolveURL(remote, it.URL)
+				if err != nil {
+					log.Error().Err(err).Str("base", remote).Str("url", it.URL).Msg("resolve url failed")
+					continue
+				}
+				// делаем прокси-путь у нас
+				specPath := "/swagger/specs/" + slug
+				if it.Name != "" {
+					specPath += "-" + slugify(it.Name)
+				} else {
+					specPath += fmt.Sprintf("-%d", i)
+				}
+				specPath += pickExt(absURL)
+
+				// регистрируем прокси
+				log.Info().Str("name", name).Str("remote", absURL).Str("specPath", specPath).Msg("Registering proxied discovered spec")
+				proxyH, proxyType := New(specPath, absURL, cfg)
+				if proxyType != "proxy" {
+					log.Fatal().Str("remote", absURL).Str("type", proxyType).Msg("Expected proxy handler for discovered spec")
+				}
+				r.Register("GET", specPath, proxyH)
+
+				// добавляем в список для UI
+				uiName := name
+				if it.Name != "" {
+					uiName = name + " • " + it.Name
+				}
+				urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, uiName, specPath))
+			}
+
+			continue
 		}
 
+		// 2) классический режим: remote — это конкретный .json/.yaml
+		ext := ".yaml"
+		if strings.HasSuffix(strings.ToLower(remote), ".json") {
+			ext = ".json"
+		}
 		specPath := "/swagger/specs/" + slug + ext
-		log.Info().Str("name", name).Str("remote", remote).Str("specPath", specPath).Msg("Registering proxy handler")
+
+		log.Info().Str("name", name).Str("remote", remote).Str("specPath", specPath).Msg("Registering proxy handler (single spec)")
 		proxyH, proxyType := New(specPath, remote, cfg)
 		if proxyType != "proxy" {
-			log.Fatal().Str("remote", remote).Str("type", proxyType).Msg("Expected proxy handler")
+			log.Fatal().Str("remote", remote).Str("type", proxyType).Msg("Expected proxy handler (single spec)")
 		}
 		r.Register("GET", specPath, proxyH)
 		urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, name, specPath))
 	}
 
+	// 3) сам UI
 	html := fmt.Sprintf(`<!doctype html>
 <html>
   <head>
@@ -206,9 +375,11 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		_, _ = ctx.WriteString(html)
 	}
+	// пути UI
 	r.Register("GET", "/swagger", handler)
 	r.Register("GET", "/swagger/index.html", handler)
-	log.Info().Msg("Swagger UI handlers registered")
+
+	log.Info().Int("specs_in_ui", len(urlsList)).Msg("Swagger UI handlers registered")
 }
 
 // func parseFromSpec(to string) (method, path string) {
