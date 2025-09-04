@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/rs/zerolog/log"
@@ -30,10 +29,6 @@ func NewProxy(from, to string, cfg config.Proxy) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		// 1) Собираем базовую цель (host+scheme+path) через твой builder
 		target := pathBuilder.Build(ctx.Path())
-
-		fmt.Println("1111")
-		fmt.Println(ctx.URI().QueryString())
-		fmt.Println("2222")
 
 		// 2) Приклеиваем СЫРОЙ query из входящего запроса (без переэнкодинга)
 		if raw := ctx.URI().QueryString(); len(raw) > 0 {

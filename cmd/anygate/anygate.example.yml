@@ -1,0 +1,14 @@
+# example config
+routes:
+
+proxy:
+  timeout: 30s
+
+static:
+  compress: true                              
+  skip_cache: true                           
+
+swagger:
+  service-1: https://petstore.swagger.io/v2/swagger
+  service-2: https://httpbin.org/spec.json
+  service-3: https://catfact.ninja/docs
