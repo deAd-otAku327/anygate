@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -86,53 +87,74 @@ func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 
 	entryList := make([]swaggerEntry, 0, len(cfg.Swagger))
 
+	var entryListMu sync.Mutex
+	var wg sync.WaitGroup
+
+	wg.Add(len(cfg.Swagger))
+
 	for name, remote := range cfg.Swagger {
-		slug := slugify(name)
 
-		// сначала пробуем достать спеку по исходному url
-		log.Info().Msg("Trying to get spec from original url")
-		status, body, err := HTTPGet(client, remote)
-		if err == nil && status < 300 {
-			// если вернулся ответ по исходному url, проверяем тело на наличие меток документации swagger (openapi)
-			if isValidSwaggerSpec(body) {
-				specPath := fmt.Sprintf("/swagger/specs/%s", slug)
-				proxyH, proxyType := New(specPath, remote, cfg)
-				if proxyType != "proxy" {
-					continue
+		go func(name, remote string) {
+			defer wg.Done()
+
+			slug := slugify(name)
+
+			// сначала пробуем достать спеку по исходному url
+			log.Info().Msg("Trying to get spec from original url")
+			status, body, err := HTTPGet(client, remote)
+			if err == nil && status < 300 {
+				// если вернулся ответ по исходному url, проверяем тело на наличие меток документации swagger (openapi)
+				if isValidSwaggerSpec(body) {
+					specPath := fmt.Sprintf("/swagger/specs/%s", slug)
+					proxyH, proxyType := New(specPath, remote, cfg)
+					if proxyType != "proxy" {
+						return
+					}
+
+					RegisterRoute(r, "GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
+
+					entryListMu.Lock()
+					entryList = append(entryList, swaggerEntry{
+						Name: name,
+						URL:  specPath,
+					})
+					entryListMu.Unlock()
+
+					return
 				}
-
-				RegisterRoute(r, "GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
-				entryList = append(entryList, swaggerEntry{
-					Name: name,
-					URL:  specPath,
-				})
-
-				continue
 			}
-		}
 
-		// если исходный url не выдал спеку - нормализуем и проверяем фолбеки (возможные ручки спеки)
-		log.Error().Err(err).Int("status", status).Msg("Failed to get spec from original url, applying fallbacks")
+			// если исходный url не выдал спеку - нормализуем и проверяем фолбеки (возможные ручки спеки)
+			log.Warn().Err(err).Int("status", status).Msg("Failed to get spec from original url, applying fallbacks")
 
-		base := normalizeBaseURL(remote)
+			base := normalizeBaseURL(remote)
 
-		targetID, targetURL := findActiveFallbackRoute(client, base)
-		if targetID < 0 {
-			continue
-		}
+			targetID, targetURL := findActiveFallbackRoute(client, base)
+			if targetID < 0 {
+				log.Error().Str("url", base).Str("reason", "no swagger urls found").Msg("No spec")
+				return
+			}
 
-		specPath := fmt.Sprintf("/swagger/specs/%s-fallback-%d%s", slug, targetID, pickExt(targetURL))
-		proxyH, proxyType := New(specPath, targetURL, cfg)
-		if proxyType != "proxy" {
-			continue
-		}
+			specPath := fmt.Sprintf("/swagger/specs/%s-fallback-%d%s", slug, targetID, pickExt(targetURL))
+			proxyH, proxyType := New(specPath, targetURL, cfg)
+			if proxyType != "proxy" {
+				log.Error().Str("url", base).Str("reason", "not a proxy type").Msg("No spec found")
+				return
+			}
 
-		RegisterRoute(r, "GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
-		entryList = append(entryList, swaggerEntry{
-			Name: name + " • fallback",
-			URL:  specPath,
-		})
+			RegisterRoute(r, "GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
+
+			entryListMu.Lock()
+			entryList = append(entryList, swaggerEntry{
+				Name: name + " • fallback",
+				URL:  specPath,
+			})
+			entryListMu.Unlock()
+		}(name, remote)
+
 	}
+
+	wg.Wait()
 
 	// далее: сборка мультиинтерфейса Swagger
 
