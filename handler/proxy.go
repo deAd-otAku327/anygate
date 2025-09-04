@@ -11,8 +11,6 @@ import (
 
 // 🚀 NewProxy — проксирует с сохранением raw query и без мутации исходного ctx.Request
 func NewProxy(from, to string, cfg config.Proxy) fasthttp.RequestHandler {
-	log.Info().Msg("IM HEREREERERRERE")
-
 	if cfg.StatusBadGateway == 0 {
 		cfg.StatusBadGateway = fasthttp.StatusBadGateway
 	}

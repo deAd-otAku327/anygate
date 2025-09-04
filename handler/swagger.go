@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"fmt"
+	"html/template"
 	"regexp"
 	"strings"
 	"time"
@@ -18,15 +19,72 @@ type swaggerEntry struct {
 	URL  string `json:"url"`
 }
 
+type swaggerUIData struct {
+	Entries     []swaggerEntry
+	SingleURL   string
+	PrimaryName string
+	UIConfig    template.JS
+}
+
+const swaggerHTMLTemplate = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Swagger UI</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui.css">
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-bundle.js"></script>
+    <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-standalone-preset.js"></script>
+    <script>
+      window.ui = SwaggerUIBundle({
+        {{.UIConfig}}
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        validatorUrl: null,
+        presets: [
+          SwaggerUIBundle.presets.apis,
+          SwaggerUIStandalonePreset
+        ],
+        layout: "StandaloneLayout",
+      });
+    </script>
+  </body>
+</html>`
+
+var swaggerUITemplate = template.Must(template.New("swaggerUI").Parse(swaggerHTMLTemplate))
+
 func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 	log.Info().Msg("Registering Swagger UI handlers")
 
-	client := &fasthttp.Client{
-		ReadTimeout:  6 * time.Second,
-		WriteTimeout: 6 * time.Second,
+	readTimeout := 6 * time.Second
+	writeTimeout := 6 * time.Second
+	maxConnsPerHost := 100
+	maxIdleConnDuration := 30 * time.Second
+
+	if cfg.Proxy.ReadTimeout > 0 {
+		readTimeout = cfg.Proxy.ReadTimeout
+	}
+	if cfg.Proxy.WriteTimeout > 0 {
+		writeTimeout = cfg.Proxy.WriteTimeout
+	}
+	if cfg.Proxy.MaxConnsPerHost > 0 {
+		maxConnsPerHost = cfg.Proxy.MaxConnsPerHost
+	}
+	if cfg.Proxy.MaxIdleConnDuration > 0 {
+		maxIdleConnDuration = cfg.Proxy.MaxIdleConnDuration
 	}
 
-	entryList := make([]swaggerEntry, 0, 16)
+	client := &fasthttp.Client{
+		ReadTimeout:         readTimeout,
+		WriteTimeout:        writeTimeout,
+		MaxConnsPerHost:     maxConnsPerHost,
+		MaxIdleConnDuration: maxIdleConnDuration,
+		Name:                cfg.Proxy.Name,
+	}
+
+	entryList := make([]swaggerEntry, 0, len(cfg.Swagger))
 
 	for name, remote := range cfg.Swagger {
 		slug := slugify(name)
@@ -36,7 +94,7 @@ func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		status, body, err := HTTPGet(client, remote)
 		if err == nil && status < 300 {
 			// если вернулся ответ по исходному url, проверяем тело на наличие меток документации swagger (openapi)
-			if bytes.Contains(body, []byte("swagger")) || bytes.Contains(body, []byte("openapi")) {
+			if isValidSwaggerSpec(body) {
 				specPath := fmt.Sprintf("/swagger/specs/%s", slug)
 				proxyH, proxyType := New(specPath, remote, cfg)
 				if proxyType != "proxy" {
@@ -54,7 +112,7 @@ func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		}
 
 		// если исходный url не выдал спеку - нормализуем и проверяем фолбеки (возможные ручки спеки)
-		log.Info().Int("status", status).Msg("Failed to get spec from original url, applying fallbacks")
+		log.Error().Err(err).Int("status", status).Msg("Failed to get spec from original url, applying fallbacks")
 
 		base := normalizeBaseURL(remote)
 
@@ -87,56 +145,65 @@ func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		primaryName = entryList[0].Name
 	}
 
-	uiConfig := ""
-
+	var uiConfig template.JS
 	if singleURL != "" {
-		uiConfig = fmt.Sprintf(`url: %q,`, singleURL)
+		uiConfig = template.JS(fmt.Sprintf(`url: %q,`, singleURL))
 	} else {
 		// ВАЖНО: правильный ключ с точкой — "urls.primaryName"
-		uiConfig = fmt.Sprintf(`urls: [%s],
+		uiConfig = template.JS(fmt.Sprintf(`urls: [%s],
         "urls.primaryName": %q,`,
 			joinSwaggerEntries(entryList),
 			primaryName,
-		)
+		))
 	}
-	log.Info().Str("uiConfig", uiConfig).Msg("Applying ui config")
+	log.Info().Str("uiConfig", string(uiConfig)).Msg("Applying ui config")
 
-	html := fmt.Sprintf(`<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>Swagger UI</title>
-    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
-  </head>
-  <body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-	<script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-standalone-preset.js"></script>
-    <script>
-      window.ui = SwaggerUIBundle({
-        %s
-        dom_id: '#swagger-ui',
-        deepLinking: true,
-        validatorUrl: null,
-		presets: [
-			SwaggerUIBundle.presets.apis,
-			SwaggerUIStandalonePreset
-		],
-		layout: "StandaloneLayout",
-      });
-    </script>
-  </body>
-</html>`, uiConfig)
+	// Подготавливаем данные для шаблона
+	templateData := swaggerUIData{
+		Entries:     entryList,
+		SingleURL:   singleURL,
+		PrimaryName: primaryName,
+		UIConfig:    uiConfig,
+	}
+
+	// Предварительно рендерим HTML шаблон
+	var htmlBuf bytes.Buffer
+	if err := swaggerUITemplate.Execute(&htmlBuf, templateData); err != nil {
+		log.Error().Err(err).Msg("Failed to render Swagger UI template")
+		return
+	}
+	renderedHTML := htmlBuf.String()
 
 	handler := func(ctx *fasthttp.RequestCtx) {
 		log.Info().Str("path", string(ctx.Path())).Int("specs", len(entryList)).Msg("Serving Swagger UI")
 		ctx.SetContentType("text/html; charset=utf-8")
 		ctx.SetStatusCode(fasthttp.StatusOK)
-		_, _ = ctx.WriteString(html)
+		_, _ = ctx.WriteString(renderedHTML)
 	}
 	r.Register("GET", "/swagger", handler)
 	r.Register("GET", "/swagger/index.html", handler)
 	log.Info().Int("specs_in_ui", len(entryList)).Msg("Swagger UI handlers registered")
+}
+
+// isValidSwaggerSpec проверяет, что тело ответа содержит валидную OpenAPI/Swagger спецификацию
+func isValidSwaggerSpec(body []byte) bool {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return false
+	}
+
+	// JSON формат
+	if body[0] == '{' {
+		return bytes.Contains(body, []byte(`"swagger"`)) ||
+			bytes.Contains(body, []byte(`"openapi"`))
+	}
+
+	// YAML формат
+	return bytes.HasPrefix(body, []byte("swagger:")) ||
+		bytes.HasPrefix(body, []byte("openapi:")) ||
+		(bytes.HasPrefix(body, []byte("---")) &&
+			(bytes.Contains(body, []byte("\nswagger:")) ||
+				bytes.Contains(body, []byte("\nopenapi:"))))
 }
 
 func slugify(s string) string {
@@ -235,7 +302,7 @@ func findActiveFallbackRoute(client *fasthttp.Client, base string) (int, string)
 
 	for i, c := range candidates {
 		status, _, err := HTTPGet(client, c)
-		if err == nil && status == 200 {
+		if err == nil && (status >= 200 && status < 300) {
 			log.Info().Str("url", c).Msg("Found active fallback swagger route")
 			return i, c
 		}
@@ -245,11 +312,22 @@ func findActiveFallbackRoute(client *fasthttp.Client, base string) (int, string)
 }
 
 func joinSwaggerEntries(entries []swaggerEntry) string {
-	result := ""
-	for _, e := range entries {
-		elem := fmt.Sprintf("{name: %q, url: %q}, ", e.Name, e.URL)
-		result += elem
+	if len(entries) == 0 {
+		return ""
 	}
 
-	return strings.TrimRight(result, ", ")
+	var builder strings.Builder
+	builder.Grow(len(entries) * 64)
+
+	for i, e := range entries {
+		if i > 0 {
+			builder.WriteString(", ")
+		}
+		_, err := fmt.Fprintf(&builder, "{name: %q, url: %q}", e.Name, e.URL)
+		if err != nil {
+			continue
+		}
+	}
+
+	return builder.String()
 }
