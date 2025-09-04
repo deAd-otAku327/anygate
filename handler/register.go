@@ -190,21 +190,21 @@ func pickExt(u string) string {
 	return ".json"
 }
 
-// нормализуем «базу» (/swagger/index.html, /swagger, /swagger/doc.json, либо просто хост)
-func normalizeBaseURL(u string) (base string) {
-	l := strings.ToLower(strings.TrimSpace(u))
-	switch {
-	case strings.HasSuffix(l, "/swagger/index.html"):
-		return u[:len(u)-len("/swagger/index.html")]
-	case strings.HasSuffix(l, "/swagger/doc.json"):
-		return u[:len(u)-len("/swagger/doc.json")]
-	case strings.HasSuffix(l, "/swagger/"):
-		return u[:len(u)-len("/swagger/")]
-	case strings.HasSuffix(l, "/swagger"):
-		return u[:len(u)-len("/swagger")]
-	default:
-		return strings.TrimRight(u, "/")
+// нормализуем «базу»: обрабатывает url на swagger (openapi), либо просто хост
+func normalizeBaseURL(u string) string {
+	lowered := strings.ToLower(strings.TrimSpace(u))
+
+	norm, _, found := strings.Cut(lowered, "/swagger")
+	if found {
+		return norm
 	}
+
+	norm, _, found = strings.Cut(lowered, "/openapi")
+	if found {
+		return norm
+	}
+
+	return strings.TrimRight(lowered, "/")
 }
 
 func resolveURL(baseStr, relStr string) (string, error) {
@@ -227,7 +227,7 @@ func httpGet(client *fasthttp.Client, u string) (int, []byte, error) {
 	if err := client.Do(&req, &resp); err != nil {
 		return 0, nil, err
 	}
-	return resp.StatusCode(), append([]byte(nil), resp.Body()...), nil
+	return resp.StatusCode(), resp.Body(), nil
 }
 
 // форсим Accept (иначе некоторые сервисы отдают text/html)
@@ -241,6 +241,10 @@ func withAcceptForSpecs(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 // после проксирования чиним Content-Type, если апстрим отдал HTML/пусто
 func wrapSpecProxy(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
+		ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+		ctx.Response.Header.Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		ctx.Response.Header.Set("Access-Control-Allow-Headers", "Content-Type, Accept")
+
 		next(ctx) // ответ уже в ctx.Response
 
 		ct := string(ctx.Response.Header.ContentType())
@@ -301,7 +305,7 @@ func normalizeJSArrayToJSON(b []byte) []byte {
 
 // одиночный url: "doc.json" / "openapi.json"
 func extractSingleURLFromIndexHTML(html []byte) string {
-	re := regexp.MustCompile(`url\s*:\s*["']([^"']+)["']`)
+	re := regexp.MustCompile(`url:\s*:\s*["']([^"']+)["']`)
 	m := re.FindSubmatch(html)
 	if len(m) >= 2 {
 		return string(m[1])
@@ -325,6 +329,35 @@ func extractSpecLikeLinks(html []byte) []string {
 	return out
 }
 
+func findActiveFallbackRoute(client *fasthttp.Client, base string) (int, string) {
+	candidates := []string{
+		base + "/doc.json",
+		base + "/swagger/doc.json",
+		base + "/swagger.json",
+		base + "/swagger.yaml",
+		base + "/swagger.yml",
+		base + "/swagger/swagger.json",
+		base + "/swagger/swagger.yaml",
+		base + "/swagger/swagger.yml",
+		base + "/openapi.json",
+		base + "/v3/api-docs",
+		base + "/swagger/doc.yaml",
+		base + "/swagger/doc.yml",
+		base + "/openapi.yaml",
+		base + "/openapi.yml",
+	}
+
+	for i, c := range candidates {
+		status, _, err := httpGet(client, c)
+		if err == nil && status == 200 {
+			log.Info().Str("candidateURL", c).Msg("Found active swagger route")
+			return i, c
+		}
+	}
+
+	return -1, ""
+}
+
 /* ============== main ============== */
 
 func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
@@ -339,8 +372,8 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 
 	for name, remote := range cfg.Swagger {
 		baseName := name
-		base := normalizeBaseURL(remote) // можно давать /swagger/index.html, /swagger, /swagger/doc.json, просто хост
-		base = strings.TrimRight(base, "/")
+
+		base := normalizeBaseURL(remote)
 		slug := slugify(baseName)
 
 		indexURL := base + "/swagger/index.html"
@@ -350,26 +383,21 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		if err != nil || status >= 300 {
 			log.Error().Err(err).Int("status", status).Str("indexURL", indexURL).Msg("Failed to fetch index.html; falling back to common paths")
 
-			candidates := []string{
-				base + "/swagger/doc.json",
-				base + "/swagger.json",
-				base + "/openapi.json",
-				base + "/v3/api-docs",
-				base + "/swagger/doc.yaml",
-				base + "/swagger/doc.yml",
-				base + "/openapi.yaml",
-				base + "/openapi.yml",
+			targetID, targetURL := findActiveFallbackRoute(client, base)
+			if targetID < 0 {
+				continue
 			}
-			for i, c := range candidates {
-				specPath := fmt.Sprintf("/swagger/specs/%s-fallback-%d%s", slug, i, pickExt(c))
-				proxyH, proxyType := New(specPath, c, cfg)
-				if proxyType != "proxy" {
-					continue
-				}
-				r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
-				urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, baseName+" • fallback", specPath))
-				log.Info().Str("remote", c).Str("specPath", specPath).Msg("Registered fallback spec")
+
+			specPath := fmt.Sprintf("/swagger/specs/%s-fallback-%d%s", slug, targetID, pickExt(targetURL))
+			proxyH, proxyType := New(specPath, targetURL, cfg)
+			if proxyType != "proxy" {
+				continue
 			}
+
+			r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
+			urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, baseName+" • fallback", specPath))
+			log.Info().Str("remote", targetURL).Str("specPath", specPath).Msg("Registered fallback spec")
+
 			continue
 		}
 
@@ -454,25 +482,19 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 		// D) если ничего не нашли — фолбэки
 		if found == 0 {
 			log.Warn().Str("base", base).Msg("No specs found in index.html; applying fallbacks")
-			candidates := []string{
-				base + "/swagger/doc.json",
-				base + "/swagger.json",
-				base + "/openapi.json",
-				base + "/v3/api-docs",
-				base + "/swagger/doc.yaml",
-				base + "/swagger/doc.yml",
-				base + "/openapi.yaml",
-				base + "/openapi.yml",
+			targetID, targetURL := findActiveFallbackRoute(client, base)
+			if targetID < 0 {
+				continue
 			}
-			for i, c := range candidates {
-				specPath := fmt.Sprintf("/swagger/specs/%s-fallback-%d%s", slug, i, pickExt(c))
-				proxyH, proxyType := New(specPath, c, cfg)
-				if proxyType != "proxy" {
-					continue
-				}
-				r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
-				urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, baseName+" • fallback", specPath))
+
+			specPath := fmt.Sprintf("/swagger/specs/%s-fallback-%d%s", slug, targetID, pickExt(targetURL))
+			proxyH, proxyType := New(specPath, targetURL, cfg)
+			if proxyType != "proxy" {
+				continue
 			}
+			r.Register("GET", specPath, wrapSpecProxy(withAcceptForSpecs(proxyH)))
+			urlsList = append(urlsList, fmt.Sprintf(`{name: %q, url: %q}`, baseName+" • fallback", specPath))
+
 		}
 	}
 
@@ -510,7 +532,7 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 			primaryName,
 		)
 	}
-
+	log.Debug().Str("uiConfig", uiConfig).Msg("Apllying ui config")
 	html := fmt.Sprintf(`<!doctype html>
 <html>
   <head>
@@ -521,13 +543,18 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
   <body>
     <div id="swagger-ui"></div>
     <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+	<script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-standalone-preset.js"></script>
     <script>
       window.ui = SwaggerUIBundle({
         %s
         dom_id: '#swagger-ui',
         deepLinking: true,
         validatorUrl: null,
-        layout: "BaseLayout"
+		presets: [
+			SwaggerUIBundle.presets.apis,
+			SwaggerUIStandalonePreset
+		],
+		layout: "StandaloneLayout",
       });
     </script>
   </body>
@@ -556,30 +583,3 @@ func registerSwaggerMultiUI(r *router.Router, cfg config.Root) {
 func registerRoute(r *router.Router, method, path string, h fasthttp.RequestHandler) {
 	r.Register(method, path, h)
 }
-
-// func registerRoute(r *router.Router, method, path string, h fasthttp.RequestHandler) {
-// 	switch method {
-// 	case "ANY":
-// 		r.ANY(path, h)
-// 	case "GET":
-// 		r.GET(path, h)
-// 	case "HEAD":
-// 		r.HEAD(path, h)
-// 	case "POST":
-// 		r.POST(path, h)
-// 	case "PUT":
-// 		r.PUT(path, h)
-// 	case "PATCH":
-// 		r.PATCH(path, h)
-// 	case "DELETE":
-// 		r.DELETE(path, h)
-// 	case "CONNECT":
-// 		r.CONNECT(path, h)
-// 	case "OPTIONS":
-// 		r.OPTIONS(path, h)
-// 	case "TRACE":
-// 		r.TRACE(path, h)
-// 	default:
-// 		log.Fatal().Str("method", method).Str("path", path).Msg("unsupported method")
-// 	}
-// }
