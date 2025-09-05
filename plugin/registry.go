@@ -6,6 +6,7 @@ type Registry = map[string]Constructor
 
 var registry = Registry{
 	"rate_limiter": RateLimiter,
+	"cors":         CorsConstructor,
 }
 
 // какие опции тут у нас есть?

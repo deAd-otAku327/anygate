@@ -90,6 +90,9 @@ plugins:
     args:
       rpm: 100
       burst: 200
+  - kind: "cors"
+    args:
+      origin: "*"
 
 # Группы
 groups:
