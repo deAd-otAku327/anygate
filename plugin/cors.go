@@ -1,6 +1,10 @@
 package plugin
 
-import "github.com/valyala/fasthttp"
+import (
+	"strconv"
+
+	"github.com/valyala/fasthttp"
+)
 
 const (
 	Origin         = "origin"
@@ -20,7 +24,7 @@ func CorsConstructor(args SpecArgs) (Func, error) {
 				methods     = "GET,HEAD,PUT,PATCH,POST,DELETE"
 				headers     = "Content-Type,Origin,Accept"
 				credentials = false
-				maxAge      string
+				maxAge      *int
 			)
 
 			for opt, value := range args {
@@ -42,8 +46,8 @@ func CorsConstructor(args SpecArgs) (Func, error) {
 						credentials = v
 					}
 				case MaxAge:
-					if v, ok := value.(string); ok {
-						maxAge = v
+					if v, ok := value.(int); ok {
+						maxAge = &v
 					}
 				}
 			}
@@ -54,8 +58,8 @@ func CorsConstructor(args SpecArgs) (Func, error) {
 			if credentials {
 				ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
 			}
-			if maxAge != "" {
-				ctx.Response.Header.Set("Access-Control-Max-Age", maxAge)
+			if maxAge != nil {
+				ctx.Response.Header.Set("Access-Control-Max-Age", strconv.Itoa(*maxAge))
 			}
 
 			if isOptions {
