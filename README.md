@@ -39,9 +39,6 @@ swagger:
   - name: service-2
     url: https://httpbin.org/spec.json
 
-  - name: service-3
-    url: https://catfact.ninja/docs
-
 # Плагины - миддлвары, которые вешаюся на хендлер
 plugins:
   - kind: rate_limiter  # Это твой любимый друг, чтобы не перегрузить систему
