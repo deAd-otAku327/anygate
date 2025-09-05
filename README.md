@@ -41,8 +41,8 @@ plugins:
       origin: "https://*.example.com" # Кому разрешаем доступ?
       methods: "GET,HEAD,PUT,PATCH,POST,DELETE" # Какие HTTP-методы разрешаем? 
       allowedHeaders: "Content-Type,Origin,Accept" # Какие заголовки можно отправлять?
-      Credentials: true  # Разрешаем передавать куки и авторизацию? 
-      MaxAge: 86400  # Сколько секунд браузер может кешировать настройки CORS?
+      credentials: true  # Разрешаем передавать куки и авторизацию? 
+      maxAge: 86400  # Сколько секунд браузер может кешировать настройки CORS?
 ```
 
 [Узнать подробнее](CONFIG.md)
