@@ -12,40 +12,150 @@ import (
 
 // 🏗️ Register — чертёж памяти, где каждый путь знает свою судьбу.
 func Register(r *router.Router, cfg config.Root, inheritedPlugins ...plugin.Spec) {
-	// Склеиваем middleware цепочку текущий группы
+	log.Info().
+		Int("routes", len(cfg.Routes)).
+		Int("swagger", len(cfg.Swagger)).
+		Int("plugins_inherited", len(inheritedPlugins)).
+		Int("plugins_cfg", len(cfg.Plugins)).
+		Msg("Register(): starting registration")
+
+	// собираем цепочку плагинов
 	fullChain := make([]plugin.Spec, 0, len(inheritedPlugins)+len(cfg.Plugins))
 	fullChain = append(fullChain, inheritedPlugins...)
 	fullChain = append(fullChain, cfg.Plugins...)
-	// Регистрируем маршруты текущей группы
+
+	log.Debug().
+		Int("full_chain_len", len(fullChain)).
+		Msg("Register(): plugin chain built")
+
+	// обрабатываем маршруты
 	for fromSpec, to := range cfg.Routes {
+		log.Debug().
+			Str("fromSpec", fromSpec).
+			Str("to", to).
+			Msg("Register(): processing route spec")
+
 		methods, from := parseFromSpec(fromSpec)
+		log.Debug().
+			Strs("methods", methods).
+			Str("from", from).
+			Msg("Register(): parsed methods and path")
+
 		base, mode := New(from, to, cfg)
+		log.Debug().
+			Str("from", from).
+			Str("to", to).
+			Str("mode", mode).
+			Msg("Register(): base handler created")
+
 		final := plugin.BuildChain(base, fullChain...)
+		log.Debug().
+			Str("from", from).
+			Str("to", to).
+			Msg("Register(): plugin chain applied to base handler")
+
 		for _, method := range methods {
-			registerRoute(r, method, from, final)
-			log.Info().Str("from", from).Str("method", method).Str("to", to).Str("mode", mode).Msg("route")
+			RegisterRoute(r, method, from, final)
+			log.Info().
+				Str("from", from).
+				Str("method", method).
+				Str("to", to).
+				Str("mode", mode).
+				Msg("Register(): route registered")
 		}
 	}
-	// Рекурсивно обрабатываем подгруппы
+
+	// рекурсивная регистрация для групп
 	for _, child := range cfg.Groups {
+		log.Info().
+			Int("child_routes", len(child.Routes)).
+			Int("child_swagger", len(child.Swagger)).
+			Msg("Register(): entering child group")
 		Register(r, child, fullChain...)
+	}
+
+	// обработка swagger
+	if len(cfg.Swagger) > 0 {
+		log.Info().
+			Any("swagger", cfg.Swagger).
+			Msg("Register(): calling registerSwaggerMultiUI")
+		RegisterSwaggerMultiUI(r, cfg)
+	} else {
+		log.Warn().
+			Msg("Register(): no Swagger configurations found")
+	}
+
+	log.Info().Msg("Register(): finished registration")
+}
+
+// Создание хендлера.
+func New(from, to string, cfg config.Root) (fasthttp.RequestHandler, string) {
+	log.Info().
+		Str("from", from).
+		Str("to", to).
+		Msg("New(): selecting handler type")
+
+	switch {
+	case to == "":
+		log.Info().
+			Str("from", from).
+			Str("mode", "ok").
+			Msg("New(): matched empty target → Ok handler")
+		return Ok, "ok"
+
+	case to == "*":
+		log.Info().
+			Str("from", from).
+			Str("mode", "echo").
+			Msg("New(): matched '*' target → Echo handler")
+		return Echo, "echo"
+
+	case strings.HasPrefix(to, "http://") || strings.HasPrefix(to, "https://"):
+		log.Info().
+			Str("from", from).
+			Str("target_url", to).
+			Str("mode", "proxy").
+			Msg("New(): matched HTTP/HTTPS → Proxy handler")
+		h := NewProxy(from, to, cfg.Proxy)
+		log.Debug().
+			Str("from", from).
+			Str("target_url", to).
+			Msg("New(): Proxy handler created")
+		return h, "proxy"
+
+	case isFixedResponse(to):
+		code, body := parseFixedResponse(to)
+		log.Info().
+			Str("from", from).
+			Str("mode", "fixed").
+			Int("status_code", code).
+			Int("body_len", len(body)).
+			Msg("New(): matched fixed response")
+		return NewFixed(code, body), "fixed"
+
+	default:
+		log.Info().
+			Str("from", from).
+			Str("target_path", to).
+			Str("mode", "static").
+			Msg("New(): default → Static handler")
+		return NewStatic(from, to, cfg.Static), "static"
 	}
 }
 
-func New(from, to string, cfg config.Root) (fasthttp.RequestHandler, string) {
-	switch {
-	case to == "":
-		return Ok, "ok"
-	case to == "*":
-		return Echo, "echo"
-	case strings.HasPrefix(to, "http://") || strings.HasPrefix(to, "https://"):
-		return NewProxy(from, to, cfg.Proxy), "proxy"
-	case isFixedResponse(to):
-		code, body := parseFixedResponse(to)
-		return NewFixed(code, body), "fixed"
-	default:
-		return NewStatic(from, to, cfg.Static), "static"
+func RegisterRoute(r *router.Router, method, path string, h fasthttp.RequestHandler) {
+	r.Register(method, path, h)
+}
+
+func HTTPGet(client *fasthttp.Client, u string) (int, []byte, error) {
+	var req fasthttp.Request
+	var resp fasthttp.Response
+	req.SetRequestURI(u)
+	req.Header.SetMethod(fasthttp.MethodGet)
+	if err := client.Do(&req, &resp); err != nil {
+		return 0, nil, err
 	}
+	return resp.StatusCode(), resp.Body(), nil
 }
 
 func parseFromSpec(spec string) ([]string, string) {
@@ -63,43 +173,3 @@ func parseFromSpec(spec string) ([]string, string) {
 	}
 	return methods, parts[len(parts)-1]
 }
-
-// func parseFromSpec(to string) (method, path string) {
-// 	for i := 0; i < len(to); i++ {
-// 		if to[i] == ' ' {
-// 			return strings.ToUpper(to[:i]), to[i+1:]
-// 		}
-// 	}
-// 	return "ANY", to
-// }
-
-func registerRoute(r *router.Router, method, path string, h fasthttp.RequestHandler) {
-	r.Register(method, path, h)
-}
-
-// func registerRoute(r *router.Router, method, path string, h fasthttp.RequestHandler) {
-// 	switch method {
-// 	case "ANY":
-// 		r.ANY(path, h)
-// 	case "GET":
-// 		r.GET(path, h)
-// 	case "HEAD":
-// 		r.HEAD(path, h)
-// 	case "POST":
-// 		r.POST(path, h)
-// 	case "PUT":
-// 		r.PUT(path, h)
-// 	case "PATCH":
-// 		r.PATCH(path, h)
-// 	case "DELETE":
-// 		r.DELETE(path, h)
-// 	case "CONNECT":
-// 		r.CONNECT(path, h)
-// 	case "OPTIONS":
-// 		r.OPTIONS(path, h)
-// 	case "TRACE":
-// 		r.TRACE(path, h)
-// 	default:
-// 		log.Fatal().Str("method", method).Str("path", path).Msg("unsupported method")
-// 	}
-// }

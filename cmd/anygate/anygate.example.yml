@@ -1,0 +1,16 @@
+# example config
+routes:
+
+proxy:
+  timeout: 30s
+
+static:
+  compress: true                              
+  skip_cache: true                           
+
+swagger:
+  - name: service-1
+    url: https://petstore.swagger.io/v2/swagger
+
+  - name: service-2
+    url: https://httpbin.org/spec.json

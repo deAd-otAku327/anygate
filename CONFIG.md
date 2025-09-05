@@ -81,6 +81,14 @@ server:
   close_on_shutdown: true                     # Вставить Connection: close при завершении
   stream_request_body: true                   # Читать тело запроса потоково
 
+# Настройки SwaggerUI c поддержкой мультиинтерфейса для набора сервисов
+swagger:
+  - name: service-1 # Тестовые сервисы
+    url: https://petstore.swagger.io/v2/swagger
+
+  - name: service-2
+    url: https://httpbin.org/spec.json
+
 # Плагины - миддлвары, которые вешаюся на хендлер
 plugins:
   - kind: "logger"                            # Имя плагина (например, встроенный логгер)

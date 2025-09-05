@@ -20,10 +20,6 @@ func main() {
 	rootConfig := config.NewRoot()
 	log.Debug().Any("root", rootConfig).Msg("config.NewRoot")
 
-	// mainRouter := router.New()
-	// handler.Register(mainRouter, rootConfig)
-	// httpServer := handler.NewServer(rootConfig.Server, mainRouter.Handler)
-
 	mainRouter := router.New()
 	handler.Register(mainRouter, rootConfig)
 	httpServer := handler.NewServer(rootConfig.Server, mainRouter.Handler)
@@ -31,7 +27,7 @@ func main() {
 	// listen
 	ln, err := net.Listen(rootConfig.Server.ListenNetwork, rootConfig.Server.ListenAddr)
 	if err != nil {
-		log.Fatal().Str("net", rootConfig.Server.ListenNetwork).Str("addr", rootConfig.Server.ListenAddr).Msg("net.Listen")
+		log.Fatal().Err(err).Str("net", rootConfig.Server.ListenNetwork).Str("addr", rootConfig.Server.ListenAddr).Msg("net.Listen")
 	}
 	// lifecycle
 	log.Info().Str("net", rootConfig.Server.ListenNetwork).Str("addr", rootConfig.Server.ListenAddr).Msg("startup")
