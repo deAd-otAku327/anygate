@@ -9,6 +9,11 @@ static:
   skip_cache: true                           
 
 swagger:
-  service-1: https://petstore.swagger.io/v2/swagger
-  service-2: https://httpbin.org/spec.json
-  service-3: https://catfact.ninja/docs
+  - name: service-1
+    url: https://petstore.swagger.io/v2/swagger
+
+  - name: service-2
+    url: https://httpbin.org/spec.json
+
+  - name: service-3
+    url: https://catfact.ninja/docs

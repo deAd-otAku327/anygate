@@ -83,9 +83,14 @@ server:
 
 # Настройки SwaggerUI c поддержкой мультиинтерфейса для набора сервисов
 swagger:
-  service-1: https://petstore.swagger.io/v2/swagger # URL`ы тестовых сервисов
-  service-2: https://httpbin.org/spec.json
-  service-3: https://catfact.ninja/docs
+  - name: service-1 # Тестовые сервисы
+    url: https://petstore.swagger.io/v2/swagger
+
+  - name: service-2
+    url: https://httpbin.org/spec.json
+
+  - name: service-3
+    url: https://catfact.ninja/docs
 
 # Плагины - миддлвары, которые вешаюся на хендлер
 plugins:

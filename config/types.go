@@ -13,7 +13,12 @@ type Root struct {
 	Static  Static            `yaml:"static"`
 	Plugins []plugin.Spec     `yaml:"plugins"`
 	Groups  []Root            `yaml:"groups"`
-	Swagger map[string]string `yaml:"swagger"`
+	Swagger []ServiceSpec     `yaml:"swagger"`
+}
+
+type ServiceSpec struct {
+	Name string `yaml:"name"`
+	URL  string `yaml:"url"`
 }
 
 // 📦 Static — контракт между диском и путём.

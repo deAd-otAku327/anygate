@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +17,9 @@ import (
 )
 
 type swaggerEntry struct {
-	Name string `json:"name"`
-	URL  string `json:"url"`
+	Name     string
+	URL      string
+	Priority int
 }
 
 type swaggerUIData struct {
@@ -92,9 +94,10 @@ func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 
 	wg.Add(len(cfg.Swagger))
 
-	for name, remote := range cfg.Swagger {
+	// приоритет вывода документации соотносится с порядком в конфиге
+	for prior, service := range cfg.Swagger {
 
-		go func(name, remote string) {
+		go func(name, remote string, prior int) {
 			defer wg.Done()
 
 			slug := slugify(name)
@@ -115,8 +118,9 @@ func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 
 					entryListMu.Lock()
 					entryList = append(entryList, swaggerEntry{
-						Name: name,
-						URL:  specPath,
+						Name:     name,
+						URL:      specPath,
+						Priority: prior,
 					})
 					entryListMu.Unlock()
 
@@ -146,11 +150,12 @@ func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 
 			entryListMu.Lock()
 			entryList = append(entryList, swaggerEntry{
-				Name: name + " • fallback",
-				URL:  specPath,
+				Name:     name + " • fallback",
+				URL:      specPath,
+				Priority: prior,
 			})
 			entryListMu.Unlock()
-		}(name, remote)
+		}(service.Name, service.URL, prior)
 
 	}
 
@@ -163,6 +168,10 @@ func RegisterSwaggerMultiUI(r *router.Router, cfg config.Root) {
 	if len(entryList) == 1 {
 		singleURL = entryList[0].URL
 	} else if len(entryList) > 1 {
+		// сортируем по приоритетам
+		sort.Slice(entryList, func(i, j int) bool {
+			return entryList[i].Priority < entryList[j].Priority
+		})
 		// возьмём имя первой спеки для "urls.primaryName"
 		primaryName = entryList[0].Name
 	}
