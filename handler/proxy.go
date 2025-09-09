@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"fmt"
 	"net/url"
 	"strings"
 	"sync"
@@ -22,6 +21,8 @@ type connParams struct {
 	timeout              time.Duration
 	statusBadGateway     int
 	statusGatewayTimeout int
+	readBufferSize       int
+	writeBufferSize      int
 }
 
 // 🚀 NewProxy — проксирует с сохранением raw query и без мутации исходного ctx.Request
@@ -39,13 +40,22 @@ func NewProxy(from, to string, cfg config.Proxy) fasthttp.RequestHandler {
 	pathBuilder := utils.NewPathBuilder(to, len(from), cfg.RouteLenHint)
 
 	client := NewClient(cfg)
-	connParams := connParams{
+
+	dialer := &websocket.Dialer{
+		ReadBufferSize:   cfg.ReadBufferSize,
+		WriteBufferSize:  cfg.WriteBufferSize,
+		HandshakeTimeout: cfg.Timeout,
+	}
+
+	connParams := &connParams{
 		proxyFrom: from,
 		proxyTo:   to,
 
 		timeout:              cfg.Timeout,
 		statusBadGateway:     cfg.StatusBadGateway,
 		statusGatewayTimeout: cfg.StatusGatewayTimeout,
+		readBufferSize:       cfg.ReadBufferSize,
+		writeBufferSize:      cfg.ReadBufferSize,
 	}
 
 	return func(ctx *fasthttp.RequestCtx) {
@@ -74,11 +84,11 @@ func NewProxy(from, to string, cfg config.Proxy) fasthttp.RequestHandler {
 		connParams.targetURL = targetURL
 
 		if string(ctx.Method()) == "GET" && websocket.FastHTTPIsWebSocketUpgrade(ctx) {
-			handleWebSocketConnection(ctx, &connParams)
+			handleWebSocketConnection(ctx, dialer, connParams)
 			return
 		}
 
-		handleHTTPConnection(ctx, client, &connParams)
+		handleHTTPConnection(ctx, client, connParams)
 	}
 }
 
@@ -111,13 +121,11 @@ func handleHTTPConnection(ctx *fasthttp.RequestCtx, client *fasthttp.Client, cp 
 	// 4) Шлём запрос и кладём ответ прямо в ctx.Response
 	if err := client.Do(req, resp); err != nil {
 		if err == fasthttp.ErrTimeout {
-			ctx.SetStatusCode(cp.statusGatewayTimeout)
-			ctx.SetBodyString(`{"error":"timeout"}`)
+			ctx.Error(`{"error":"timeout"}`, cp.statusGatewayTimeout)
 			log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("timeout")
 			return
 		}
-		ctx.SetStatusCode(cp.statusBadGateway)
-		ctx.SetBodyString(`{"error":"` + err.Error() + `"}`)
+		ctx.Error(`{"error":"`+err.Error()+`"}`, cp.statusBadGateway)
 		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("gateway")
 		return
 	}
@@ -133,21 +141,34 @@ func handleHTTPConnection(ctx *fasthttp.RequestCtx, client *fasthttp.Client, cp 
 		Msg("Proxy success")
 }
 
-func handleWebSocketConnection(ctx *fasthttp.RequestCtx, cp *connParams) {
+func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Dialer, cp *connParams) {
 	cp.targetURL.Scheme = "ws"
-	fmt.Println("socket on " + cp.targetURL.String())
 
-	serverConn, _, err := websocket.DefaultDialer.Dial(
-		cp.targetURL.String(),
-		nil,
-	)
+	log.Info().
+		Str("from", cp.proxyFrom).
+		Str("to", cp.proxyTo).
+		Str("target", cp.targetURL.String()).
+		Bytes("raw_query_in", ctx.URI().QueryString()).
+		Msg("proxy -> websocket upstream")
+
+	serverConn, resp, err := dialer.Dial(cp.targetURL.String(), nil)
 	if err != nil {
-		log.Printf("Error connecting to server WebSocket on %s: %v", cp.targetURL, err)
-		ctx.Error("Failed to connect to server", fasthttp.StatusBadGateway)
+		ctx.Error(`{"error":"`+err.Error()+`"}`, fasthttp.StatusBadGateway)
+		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("Failed to connect to websocket server")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != fasthttp.StatusSwitchingProtocols {
+		ctx.Error(`{"error":"bad handshake"}`, fasthttp.StatusBadGateway)
+		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("bad handshake")
 		return
 	}
 
 	connUpgrader := websocket.FastHTTPUpgrader{
+		ReadBufferSize:   cp.readBufferSize,
+		WriteBufferSize:  cp.writeBufferSize,
+		HandshakeTimeout: cp.timeout,
 		CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
 			return true
 		},
@@ -155,7 +176,6 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, cp *connParams) {
 
 	// Обновляем соединение клиента до WebSocket
 	err = connUpgrader.Upgrade(ctx, func(clientConn *websocket.Conn) {
-
 		defer func() {
 			serverConn.Close()
 			clientConn.Close()
@@ -175,14 +195,11 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, cp *connParams) {
 		}()
 
 		wg.Wait()
-		fmt.Printf("CALLBACK END for %s", clientConn.RemoteAddr())
 	})
 
 	if err != nil {
-		fmt.Printf("WebSocket upgrade error: %v", err)
+		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("WebSocket upgrade error")
 	}
-
-	fmt.Printf("HANDLER END for %s", ctx.RemoteAddr())
 }
 
 func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn, direction string) {
@@ -192,19 +209,16 @@ func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn, direct
 			return
 		default:
 			messageType, message, err := src.ReadMessage()
-			fmt.Println("re ", string(message))
 			if err != nil {
-				fmt.Printf("WebSocket read error (%s): %v", direction, err)
+				log.Error().Err(err).Str("src", src.RemoteAddr().String()).Msg("Websocket read error")
 				return
 			}
 
 			err = dst.WriteMessage(messageType, message)
-			fmt.Println("wr ", string(message))
 			if err != nil {
-				fmt.Printf("WebSocket write error (%s): %v", direction, err)
+				log.Error().Err(err).Str("dst", dst.RemoteAddr().String()).Msg("Websocket write error")
 				return
 			}
 		}
 	}
-
 }
