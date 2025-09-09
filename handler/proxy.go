@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/url"
 	"strings"
 	"sync"
@@ -152,6 +153,7 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 		Msg("proxy -> websocket upstream")
 
 	serverConn, resp, err := dialer.Dial(cp.targetURL.String(), nil)
+
 	if err != nil {
 		ctx.Error(`{"error":"`+err.Error()+`"}`, fasthttp.StatusBadGateway)
 		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("Failed to connect to websocket server")
@@ -179,6 +181,11 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 		defer func() {
 			serverConn.Close()
 			clientConn.Close()
+
+			log.Info().
+				Str("from", clientConn.RemoteAddr().String()).
+				Str("to", serverConn.RemoteAddr().String()).
+				Msg("websocket connection pipe closed")
 		}()
 
 		var wg sync.WaitGroup
@@ -186,23 +193,28 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 
 		go func() {
 			defer wg.Done()
-			forwardWebSocket(ctx, clientConn, serverConn, "client->server")
+			forwardWebSocket(ctx, clientConn, serverConn)
 		}()
 
 		go func() {
 			defer wg.Done()
-			forwardWebSocket(ctx, serverConn, clientConn, "server->client")
+			forwardWebSocket(ctx, serverConn, clientConn)
 		}()
 
+		log.Info().
+			Str("from", clientConn.RemoteAddr().String()).
+			Str("to", serverConn.RemoteAddr().String()).
+			Msg("websocket connection pipe opened")
 		wg.Wait()
 	})
 
 	if err != nil {
+		ctx.Error(`{"error":"connection upgrade error"}`, fasthttp.StatusUpgradeRequired)
 		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("WebSocket upgrade error")
 	}
 }
 
-func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn, direction string) {
+func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -210,13 +222,17 @@ func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn, direct
 		default:
 			messageType, message, err := src.ReadMessage()
 			if err != nil {
-				log.Error().Err(err).Str("src", src.RemoteAddr().String()).Msg("Websocket read error")
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) && !errors.Is(err, websocket.ErrCloseSent) {
+					log.Error().Err(err).Str("src", src.RemoteAddr().String()).Msg("Websocket read error")
+				}
 				return
 			}
 
 			err = dst.WriteMessage(messageType, message)
 			if err != nil {
-				log.Error().Err(err).Str("dst", dst.RemoteAddr().String()).Msg("Websocket write error")
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) && !errors.Is(err, websocket.ErrCloseSent) {
+					log.Error().Err(err).Str("dst", dst.RemoteAddr().String()).Msg("Websocket write error")
+				}
 				return
 			}
 		}
