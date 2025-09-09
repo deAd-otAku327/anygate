@@ -110,12 +110,12 @@ func New(from, to string, cfg config.Root) (fasthttp.RequestHandler, string) {
 			Msg("New(): matched '*' target → Echo handler")
 		return Echo, "echo"
 
-	case strings.HasPrefix(to, "http://") || strings.HasPrefix(to, "https://"):
+	case strings.HasPrefix(to, "http://") || strings.HasPrefix(to, "https://") || strings.HasPrefix(to, "ws://") || strings.HasPrefix(to, "wss://"):
 		log.Info().
 			Str("from", from).
 			Str("target_url", to).
 			Str("mode", "proxy").
-			Msg("New(): matched HTTP/HTTPS → Proxy handler")
+			Msg("New(): matched HTTP/HTTPS/WS/WSS → Proxy handler")
 		h := NewProxy(from, to, cfg.Proxy)
 		log.Debug().
 			Str("from", from).

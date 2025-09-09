@@ -60,10 +60,10 @@ func NewProxy(from, to string, cfg config.Proxy) fasthttp.RequestHandler {
 	}
 
 	return func(ctx *fasthttp.RequestCtx) {
-		// 1) Собираем базовую цель (scheme+host+path) через builder
+		// Собираем базовую цель (scheme+host+path) через builder
 		target := pathBuilder.Build(ctx.Path())
 
-		// 2) Приклеиваем СЫРОЙ query из входящего запроса (без переэнкодинга)
+		// Приклеиваем СЫРОЙ query из входящего запроса (без переэнкодинга)
 		if raw := ctx.URI().QueryString(); len(raw) > 0 {
 			if strings.Contains(target, "?") {
 				target += "&" + string(raw)
@@ -84,7 +84,9 @@ func NewProxy(from, to string, cfg config.Proxy) fasthttp.RequestHandler {
 
 		connParams.targetURL = targetURL
 
+		// Определяем запрос с апгрейдом на вебсокет
 		if string(ctx.Method()) == "GET" && websocket.FastHTTPIsWebSocketUpgrade(ctx) {
+
 			handleWebSocketConnection(ctx, dialer, connParams)
 			return
 		}
@@ -94,7 +96,7 @@ func NewProxy(from, to string, cfg config.Proxy) fasthttp.RequestHandler {
 }
 
 func handleHTTPConnection(ctx *fasthttp.RequestCtx, client *fasthttp.Client, cp *connParams) {
-	// 3) Готовим отдельный запрос (не трогаем ctx.Request)
+	// Готовим отдельный запрос (не трогаем ctx.Request)
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer func() {
@@ -119,7 +121,7 @@ func handleHTTPConnection(ctx *fasthttp.RequestCtx, client *fasthttp.Client, cp 
 		Bytes("raw_query_in", ctx.URI().QueryString()).
 		Msg("proxy -> upstream")
 
-	// 4) Шлём запрос и кладём ответ прямо в ctx.Response
+	// Шлём запрос и кладём ответ прямо в ctx.Response
 	if err := client.Do(req, resp); err != nil {
 		if err == fasthttp.ErrTimeout {
 			ctx.Error(`{"error":"timeout"}`, cp.statusGatewayTimeout)
@@ -143,7 +145,10 @@ func handleHTTPConnection(ctx *fasthttp.RequestCtx, client *fasthttp.Client, cp 
 }
 
 func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Dialer, cp *connParams) {
-	cp.targetURL.Scheme = "ws"
+	// Схема подключения - вебсокет (меняем если указано http(s))
+	if strings.HasPrefix(cp.targetURL.Scheme, "http") {
+		cp.targetURL.Scheme = strings.Replace(cp.targetURL.Scheme, "http", "ws", 1)
+	}
 
 	log.Info().
 		Str("from", cp.proxyFrom).
@@ -152,8 +157,8 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 		Bytes("raw_query_in", ctx.URI().QueryString()).
 		Msg("proxy -> websocket upstream")
 
+	// Устанавливаем соединение с сервером
 	serverConn, resp, err := dialer.Dial(cp.targetURL.String(), nil)
-
 	if err != nil {
 		ctx.Error(`{"error":"`+err.Error()+`"}`, fasthttp.StatusBadGateway)
 		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("Failed to connect to websocket server")
@@ -161,6 +166,7 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 	}
 	defer resp.Body.Close()
 
+	// Дополнительная проверка на успешность хендшейка
 	if resp.StatusCode != fasthttp.StatusSwitchingProtocols {
 		ctx.Error(`{"error":"bad handshake"}`, fasthttp.StatusBadGateway)
 		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("bad handshake")
@@ -176,9 +182,10 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 		},
 	}
 
-	// Обновляем соединение клиента до WebSocket
+	// Регистрируем хендлер пайпа между клиентом и сервером (обработка клиентских подключений)
 	err = connUpgrader.Upgrade(ctx, func(clientConn *websocket.Conn) {
 		defer func() {
+			// Для надежности
 			serverConn.Close()
 			clientConn.Close()
 
@@ -191,6 +198,7 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 		var wg sync.WaitGroup
 		wg.Add(2)
 
+		// Две горутины проксируют трафик между сервером и клиентом (в обе стороны)
 		go func() {
 			defer wg.Done()
 			forwardWebSocket(ctx, clientConn, serverConn)
@@ -205,6 +213,8 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 			Str("from", clientConn.RemoteAddr().String()).
 			Str("to", serverConn.RemoteAddr().String()).
 			Msg("websocket connection pipe opened")
+
+		// Ожидание момента когда прервется проксирование на оба направления
 		wg.Wait()
 	})
 
@@ -212,27 +222,48 @@ func handleWebSocketConnection(ctx *fasthttp.RequestCtx, dialer *websocket.Diale
 		ctx.Error(`{"error":"connection upgrade error"}`, fasthttp.StatusUpgradeRequired)
 		log.Error().Err(err).Str("from", cp.proxyFrom).Str("to", cp.proxyTo).Msg("WebSocket upgrade error")
 	}
+
+	// ВАЖНО: блокирование завершения данной функции препятствует работе обработчика клиентских подключений (см выше: Upgrade() )
 }
 
+// Проксирование вебсокет трафика src -> dst
 func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			initiatedClosing := false
+
+			// Ждем сообщения
 			messageType, message, err := src.ReadMessage()
 			if err != nil {
+				// Логируем, если закрытие не штатное или другая ошибка.
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) && !errors.Is(err, websocket.ErrCloseSent) {
 					log.Error().Err(err).Str("src", src.RemoteAddr().String()).Msg("Websocket read error")
 				}
-				return
+
+				// Если ошибка не связана с закрытием src-соединения - просто продолжаем ждать следующего сообщения
+				if _, ok := err.(*websocket.CloseError); !ok {
+					continue
+				}
+
+				// Если src закрыт - необходимо инициировать разрыв пайпа и отправить close-message на dst, который инициирует его штатное закрытие
+				messageType = websocket.CloseMessage
+				initiatedClosing = true
 			}
 
+			// Пишем сообщение на dst
+			// В случае получения перед этим close-message, оно будет переотправлено на dst (уже закрытое), во имя лучшей читаемости
 			err = dst.WriteMessage(messageType, message)
 			if err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) && !errors.Is(err, websocket.ErrCloseSent) {
 					log.Error().Err(err).Str("dst", dst.RemoteAddr().String()).Msg("Websocket write error")
 				}
+			}
+
+			// Если было инициировано закрытие - выходим
+			if initiatedClosing {
 				return
 			}
 		}
