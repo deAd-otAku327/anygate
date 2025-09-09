@@ -1,5 +1,7 @@
 # example config
 routes:
+  /api/v1/basic: http://localhost:8080/health
+  /socket.io/ : http://localhost:8000/socket.io/
 
 proxy:
   timeout: 30s
