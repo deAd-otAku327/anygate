@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"sync"
@@ -239,7 +240,7 @@ func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn) {
 			messageType, message, err := src.ReadMessage()
 			if err != nil {
 				// Логируем, если закрытие не штатное или другая ошибка.
-				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) && !errors.Is(err, websocket.ErrCloseSent) {
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					log.Error().Err(err).Str("src", src.RemoteAddr().String()).Msg("Websocket read error")
 				}
 
@@ -250,6 +251,7 @@ func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn) {
 
 				// Если src закрыт - необходимо инициировать разрыв пайпа и отправить close-message на dst, который инициирует его штатное закрытие
 				messageType = websocket.CloseMessage
+				message = websocket.FormatCloseMessage(websocket.CloseGoingAway, "pipe closing initiated")
 				initiatedClosing = true
 			}
 
@@ -257,6 +259,7 @@ func forwardWebSocket(ctx *fasthttp.RequestCtx, src, dst *websocket.Conn) {
 			// В случае получения перед этим close-message, оно будет переотправлено на dst (уже закрытое), во имя лучшей читаемости
 			err = dst.WriteMessage(messageType, message)
 			if err != nil {
+				fmt.Println(err)
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) && !errors.Is(err, websocket.ErrCloseSent) {
 					log.Error().Err(err).Str("dst", dst.RemoteAddr().String()).Msg("Websocket write error")
 				}
